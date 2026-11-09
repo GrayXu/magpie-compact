@@ -1178,12 +1178,10 @@ type sealedItem struct {
 	Enc  string `json:"encrypted_content"`
 }
 
-// sealedKinds are the input items a vendor seals for itself: its
-// reasoning, and the compaction a conversation's earlier turns were
-// folded into (OpenAI's, when Codex compacts on its own models; magpie's
-// own is text by the time a request is sent). Refused, they go whole;
-// any other item loses its sealed copy alone (withoutItemSeal).
-var sealedKinds = map[string]bool{"reasoning": true, "compaction": true, "compaction_summary": true}
+// sealedKinds are items removed whole after their seals are refused.
+// Compactions keep their seals: removing one would lose earlier context.
+// Any other item loses its sealed copy alone (withoutItemSeal).
+var sealedKinds = map[string]bool{"reasoning": true}
 
 var compactionKinds = []string{"compaction", "compaction_summary"}
 
@@ -1245,7 +1243,7 @@ func noteRefused(key, who string, ss [][sha256.Size]byte) {
 }
 
 // withoutRefused takes out of a Responses request what who already
-// refused in this conversation: sealed reasoning and compactions whole,
+// refused in this conversation: sealed reasoning whole,
 // any other item's sealed copy alone; the rest stays as it is.
 func withoutRefused(key, who string, body []byte) ([]byte, bool) {
 	k := key + "|" + who
@@ -1339,26 +1337,6 @@ func withoutItemSeal(it []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return withoutTopMember(it, "encrypted_content"), true
-}
-
-// withoutCompaction takes out of a Responses request's input the sealed
-// compaction of its earlier turns — OpenAI's, which no other vendor or
-// account can read (waroy: Grok's "Could not decrypt the provided
-// encrypted_content" with the reasoning already gone). What the turns
-// since said and did stays; the summary of those before goes.
-func withoutCompaction(body []byte) ([]byte, bool) {
-	var q struct {
-		Input []sealedItem `json:"input"`
-	}
-	if decodeJSON(body, &q) != nil {
-		return nil, false
-	}
-	for _, it := range q.Input {
-		if slices.Contains(compactionKinds, it.Type) && it.Enc != "" {
-			return withoutKinds(body, compactionKinds...)
-		}
-	}
-	return nil, false
 }
 
 // overflowLearned remembers, per conversation and the provider's model

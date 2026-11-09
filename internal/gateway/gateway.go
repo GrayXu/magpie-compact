@@ -2843,46 +2843,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	if sealedTask {
 		cands, pl = s.sealedReaders(cands, pl, sealers)
 	}
-	// a compaction a provider set to compact natively sealed goes only to
-	// the key or account that sealed it, or is refused saying so: never
-	// to another, to be refused, dropped or summarised (#1099). Codex's
-	// trigger goes only where it can be asked as Codex sent it.
-	var checkpoint *checkpointWriter
-	if from == provider.Responses {
-		if cp, ok := checkpointOf(body); ok {
-			checkpoint = &cp
-			kept, keptPl, left := checkpointReaders(cands, pl, cp)
-			if !left && compactionAside(call.Kind, asked) {
-				// a call beside the conversation (an approval's review, a
-				// memory, a subagent) on a model its writer doesn't serve:
-				// asked without the seal, which no other can read (echo_ts:
-				// a Copilot compaction sent to codex-auto-review, refused
-				// as invalid_encrypted_content every review). The
-				// conversation's own turns are still held to the writer
-				if b, ok := withoutCompaction(body); ok {
-					body, checkpoint, left = b, nil, true
-					kept, keptPl = cands, pl
-					if p, ok := withoutCompaction(plain); ok {
-						plain = p
-					}
-				}
-			}
-			cands, pl = kept, keptPl
-			if !left {
-				call.Status, call.Error = 400, "native compaction sealed elsewhere"
-				writeError(w, from, 400, checkpointError(call.Model, cp))
-				turnedAway()
-				return
-			}
-		}
-		if compactionTriggerIn(body) {
-			var left bool
-			if cands, pl, left = s.compactionCarriers(cands, pl); !left {
-				call.Status, call.Error = 400, "native compaction not carried"
-				writeError(w, from, 400, carrierError(call.Model))
-				turnedAway()
-				return
-			}
+	// Native compaction follows the ordinary route, across accounts and
+	// providers, but needs Responses so its sealed context stays intact.
+	if keepsCompaction(from, body) {
+		var left bool
+		if cands, pl, left = s.compactionCarriers(cands, pl); !left {
+			call.Status, call.Error = 400, "native compaction not carried"
+			writeError(w, from, 400, carrierError(call.Model))
+			turnedAway()
+			return
 		}
 	}
 	var accountHeld bool // every candidate was an account or key the calling key may not use
@@ -2941,19 +2910,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		var msg, record string
 		var back time.Time
-		if sealer := checkpointHeld(checkpoint, held, pl); sealer != nil {
-			// only the account that sealed the conversation's native
-			// compaction was a candidate, and it is held: the others
-			// weren't tried for that, not for being held too (#2517)
-			msg, back = checkpointCappedError(call.Model, *checkpoint, sealer, time.Now())
-			record = checkpointCappedRecord(sealer)
-		} else {
-			msg, back = cappedError(call.Model, held, time.Now())
-			if strictHeld != nil {
-				msg += ". The conversation stays strictly on that account (Stays: Strict), so magpie doesn't move it to another"
-			}
-			record = cappedRecord(held)
+		msg, back = cappedError(call.Model, held, time.Now())
+		if strictHeld != nil {
+			msg += ". The conversation stays strictly on that account (Stays: Strict), so magpie doesn't move it to another"
 		}
+		record = cappedRecord(held)
 		if d := time.Until(back); d > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds())+1))
 		}
@@ -3133,7 +3094,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		poolRouting, poolGroup = g.Routing, &g
 	}
 	leastHeldIt := aff.Why == "first" && (rotate || spread)
-	reorder := !aff.Kept && aff.Why != "strict" && pin == "" && leadAccount == "" && checkpoint == nil && !leastHeldIt
+	reorder := !aff.Kept && aff.Why != "strict" && pin == "" && leadAccount == "" && !leastHeldIt
 	cands, pl, unburst := burstSpread(poolRouting, poolGroup, hit != nil && hit.Use != "", reorder, cands, pl)
 	defer unburst()
 	// of those resting, only the one back soonest is asked (#1799); the
@@ -3164,7 +3125,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		capture.tools = tools
 	}
 	tierAsked := bodyTier(from, body) // the service tier the client asked for (#1784)
-	tr := s.trace.beginFor(r, Route{turn: turn, dirOf: dirOf(from, plain), tools: tools, imageTurn: drawingTurnID(metadata.Turn), imageCaller: codexTurnKey(r, call.Agent), TitleLink: link, Pinned: pinnedName(pin), Time: start, Agent: call.Agent, Session: sessionOf(r.Header), Conv: convOf(r.Header, body), LastConvs: dshLastConvs(call.Agent, body), ParentSession: titleParentSession(r.Header, metadata, call.Kind), Kind: call.Kind, For: call.For, Model: call.Model, Effort: requestEffort(from, body), Tier: tierAsked, Provider: p.ID, Group: group, Rule: hit, Nested: nested, SealedTask: sealedTask, LeadAccount: leadAccount, Compaction: compactionWho(checkpoint), Subagent: subagent, Moved: moved, SubagentEffort: subagentEffort, Sub: subOf(r.Header), SubagentID: subagentID, Affinity: shown, Order: pl.order, Left: append(slices.Clip(pl.left), smallW...)})
+	tr := s.trace.beginFor(r, Route{turn: turn, dirOf: dirOf(from, plain), tools: tools, imageTurn: drawingTurnID(metadata.Turn), imageCaller: codexTurnKey(r, call.Agent), TitleLink: link, Pinned: pinnedName(pin), Time: start, Agent: call.Agent, Session: sessionOf(r.Header), Conv: convOf(r.Header, body), LastConvs: dshLastConvs(call.Agent, body), ParentSession: titleParentSession(r.Header, metadata, call.Kind), Kind: call.Kind, For: call.For, Model: call.Model, Effort: requestEffort(from, body), Tier: tierAsked, Provider: p.ID, Group: group, Rule: hit, Nested: nested, SealedTask: sealedTask, LeadAccount: leadAccount, Subagent: subagent, Moved: moved, SubagentEffort: subagentEffort, Sub: subOf(r.Header), SubagentID: subagentID, Affinity: shown, Order: pl.order, Left: append(slices.Clip(pl.left), smallW...)})
 	if watched != nil {
 		watched.routeID = tr.ID
 	}
@@ -3189,7 +3150,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	wentTier := ""   // the service tier the last try went out at (noteWireTier, #1784)
 	where := ""      // the last try's provider.Where, for the usage
 	again := 0       // times the last one left has been tried again
-	resealed := 0    // what of the conversation another account sealed was taken out: its reasoning, then its compaction
+	resealed := 0    // whether unreadable reasoning was taken out and retried
 	repicked := 0    // times Copilot's Auto was asked again for a model the account is served
 	floored := false // the reply's length raised to what the provider takes
 	plainFor := ""   // the account and model asked again without effort updates (#617)
@@ -3207,10 +3168,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// the subscription/model pairs an account refused as a model it doesn't
 	// serve, for the accounts whose own list lacks it to be asked next
 	// (unlistedNext); none for a request pinned to an account, a
-	// conversation sealed to one or kept strictly on one
+	// conversation kept strictly on one
 	unservedBy := map[string]bool{}
 	unlisted, unlistedW := pl.unlisted, pl.unlistedW
-	if pin != "" || checkpoint != nil || aff.Why == "strict" {
+	if pin != "" || aff.Why == "strict" {
 		unlisted, unlistedW = nil, nil
 	}
 	// what the tries' held streams sent the agent ahead of a reply (#751)
@@ -3278,9 +3239,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// and the provider's last answer, saved to disk, took seconds on a busy
 	// disk, and the reply's speed counted them as its own)
 	var ended time.Time
-	// the compaction a provider set to compact natively seals, read on the
-	// way to Codex, and who sealed it remembered once it has answered
-	// (#1099)
+	// Keep the compaction's provenance for existing checkpoint readers;
+	// it no longer limits which account or provider can serve a replay.
 	var sealedBy *candidate
 	wantWhole := wantsWhole(r.Context())
 	if from == provider.Responses && compactionTriggerIn(body) {
@@ -4195,21 +4155,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// sealed copy, #3887), and what it refused isn't sent here
 			// again. xAI says so as a 400, or as the stream's error, which
 			// may be read as another status. Refused again, or with
-			// nothing else sealed to leave out, it's the compaction OpenAI
-			// sealed that goes (waroy: Codex compacted on GPT, then
-			// switched to Grok)
+			// nothing else sealed to leave out, the compaction stays and
+			// the upstream's refusal is returned.
 			b, ok := []byte(nil), false
 			if resealed == 0 {
 				resealed = 1
 				if b, ok = withoutSeals(body); ok {
-					refused(stuck, c.vendor(), attemptBody, b)
-				}
-			}
-			// a compaction sealed where native compaction is on is never
-			// left out: its writer's refusal goes back as it came (#1099)
-			if !ok && checkpoint == nil && !s.compactsNatively(c.p, c.model) {
-				resealed = 2
-				if b, ok = withoutCompaction(body); ok {
 					refused(stuck, c.vendor(), attemptBody, b)
 				}
 			}
@@ -5116,9 +5067,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				// long on the way is forgotten (#3453)
 				forgetOverflow(stuck, c)
 			}
-			// the trigger was kept, so whoever answered sealed it: a
-			// fallback whose own native compaction is off too, whose seal
-			// only it can read (#2271)
 			sealedBy = &c
 			if hit != nil && !hit.Compact {
 				ruleAnswered(ruleAt, call.Usage, coldAfter(c.p))
@@ -5386,10 +5334,9 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	if relay && from == provider.Chat && !streamOf(body) && dashScope(p) {
 		relay, ownAPI = false, true
 	}
-	// Codex's compaction trigger, or a compaction sealed where native
-	// compaction is on, goes as it came: a translation would leave it out
-	// (#1099)
-	keep := s.keepsCompaction(from, p, model, body)
+	// Native compaction goes as it came, whichever account or provider
+	// answered it: a translation would leave its context out.
+	keep := keepsCompaction(from, body)
 	// Codex's custom tools, to a model that turned them away before
 	// (custom_tool.go, #2656): translated on the client's own API, which
 	// offers them as functions

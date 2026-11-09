@@ -88,9 +88,8 @@ type Route struct {
 	Rule          *RuleHit     `json:"rule,omitempty"`          // the group's rules for it, when it has any
 	SealedTask    bool         `json:"sealedTask,omitempty"`    // only ChatGPT accounts can read this subagent's task
 	LeadAccount   string       `json:"leadAccount,omitempty"`   // the parent account put first for a sealed task
-	// Compaction: the key or account that sealed the native compaction
-	// the request carries, the only one it went to (#1099): Routing says
-	// so, not that it is the only one on for the model (#2639)
+	// Compaction is the writer binding recorded by older versions, kept
+	// so historical routes remain readable. New routes leave it empty.
 	Compaction string `json:"compaction,omitempty"`
 	// Subagent is a Codex or Claude Desktop subagent's request put on
 	// the model set for its subagents, or kept on the one asked for and why
@@ -578,10 +577,8 @@ type planned struct {
 	// go on there (provider.AffinityStrict, #1797)
 	capped []candidate
 	// unlisted: the accounts left out (in left) as their own list lacks
-	// the model, their rows beside them in unlistedW, kept for the
-	// checkpoint narrowing: the one that sealed a conversation's compaction
-	// is tried for it as the last resort an account whose list lacks the
-	// model is, though no other can read it
+	// the model, their rows beside them in unlistedW, tried after the
+	// listed accounts refuse the model (unlistedNext).
 	unlisted  []candidate
 	unlistedW []Weighed
 }

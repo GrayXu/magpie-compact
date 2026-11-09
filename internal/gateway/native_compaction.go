@@ -1,20 +1,8 @@
 package gateway
 
-// Native compaction (#1099): a provider the user set to compact natively
-// (provider.Provider.NativeCompaction) is asked Codex's compaction_trigger
-// as Codex sent it, and the compaction item it writes back goes to Codex
-// as it came, sealed (encrypted_content), not as magpie's "magpie1:"
-// summary. Only the key or account that sealed it can read it again, so
-// magpie remembers who wrote each one (compactions.json, beside
-// affinity.json), and a later request carrying it goes only there — a
-// writer whose own list has since dropped the model included, tried as
-// the last resort an account whose list lacks the model is. When that one
-// can't be asked — switched off, removed, out of the group — the request
-// is refused, saying why: the compaction is never sent to another to be
-// refused, dropped (withoutCompaction), or summarised in its place, which
-// would lose the conversation's earlier context unasked. A call beside
-// the conversation (compactionAside: Codex's auto-review and the like),
-// which its writer doesn't serve, goes without it instead.
+// Native compaction is passed through unchanged on Responses. Its sealed
+// context follows the ordinary route across accounts, providers and
+// clients; the destination upstream decides whether it can read it.
 
 import (
 	"bytes"
@@ -34,7 +22,6 @@ import (
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/steady"
-	"github.com/yetone/magpie/internal/usage"
 )
 
 const (
@@ -144,74 +131,11 @@ func (s *Server) plannedCarrier(p provider.Provider, model string) bool {
 	return false
 }
 
-// keepsCompaction is whether body goes to p as it is for its compaction:
-// Codex's trigger, to one that carries it, or a sealed compaction, to one
-// set to compact natively or recorded as its writer — a fallback that
-// answered a native compaction for another sealed it whatever its own
-// setting (#2271). A translation would leave either out, so such a request
-// is relayed.
-func (s *Server) keepsCompaction(from provider.Protocol, p provider.Provider, model string, body []byte) bool {
-	if from != provider.Responses || !s.carriesCompaction(p, model) {
-		return false
-	}
-	if compactionTriggerIn(body) {
-		return true
-	}
-	if len(sealedCompactions(body)) == 0 {
-		return false
-	}
-	if p.CompactsOn(model) {
-		return true
-	}
-	cp, ok := checkpointOf(body)
-	return ok && cp.Provider == p.ID
-}
-
-// compactionAside is whether a call is one Codex makes beside the
-// conversation, on a model of its own choosing, with the conversation's
-// history in it: the auto-review of an approval (the guardian, asked on
-// codex-auto-review or the model set for it), a memory, a subagent, a
-// thread's title, description, summary, the next message's prediction or
-// a suggestion, each on the model set for it. A
-// compaction another provider sealed reaches it only because the history
-// does, and no model but its writer's reads it; such a call goes without
-// it rather than be refused, as each review was (echo_ts: Copilot's
-// compaction sent to OpenAI's codex-auto-review, 400
-// invalid_encrypted_content). What the call is about — the instructions,
-// the turns since and their tool calls — stays. The conversation's own
-// turns are held to the writer still (#1099).
-func compactionAside(kind, model string) bool {
-	switch usage.PurposeOf(kind) {
-	case "kind:guardian", "kind:memory_consolidation", "kind:collab_spawn",
-		"kind:thread_title", "kind:thread_description", "kind:composer_predictions", "kind:ambient_suggestions":
-		return true
-	}
-	if isSummaryKind(kind) {
-		return true
-	}
-	_, bare, _ := strings.Cut(model, "/")
-	if bare == "" {
-		bare = model
-	}
-	return bare == provider.CodexAutoReview
-}
-
-// foreignToSignin is the writer of a compaction body carries that
-// Codex's own ChatGPT sign-in can't read: one magpie recorded as sealed
-// by a provider in magpie other than the Codex subscription (Copilot, an
-// API key's). A seal of the Codex subscription's, one magpie has no
-// record of (OpenAI's own, compacted on the sign-in), and one whose
-// provider can't be read now are the sign-in's to judge, as before.
-func foreignToSignin(body []byte) (checkpointWriter, bool) {
-	cp, ok := checkpointOf(body)
-	if !ok || cp.Provider == "codex" {
-		return checkpointWriter{}, false
-	}
-	p, err := provider.Find(cp.Provider)
-	if err != nil || p.Account != nil && p.Account.Agent == "codex" {
-		return checkpointWriter{}, false
-	}
-	return cp, true
+// keepsCompaction says whether a Responses request needs its native
+// compaction preserved, including one produced by another provider or
+// client. Translating it would silently lose the earlier context.
+func keepsCompaction(from provider.Protocol, body []byte) bool {
+	return from == provider.Responses && (compactionTriggerIn(body) || len(sealedCompactions(body)) > 0)
 }
 
 // checkpointWriter is who sealed a compaction: the key or account
@@ -361,68 +285,8 @@ func saveCheckpoints() {
 	}
 }
 
-// checkpointReaders keeps of cands those of the key or account that
-// sealed cp (behind a remote magpie, of the provider there too), pl's
-// order with them; left says one is left, if only held or capped. One
-// whose own list lacks the model now (planned.unlisted) is kept too: it
-// is tried as the last resort an account whose list lacks the model is,
-// and none other can read what it sealed. Its row goes from left to the
-// order with it, so the Routing page doesn't tell it both tried and
-// unlisted, skipped.
-func checkpointReaders(cands []candidate, pl planned, cp checkpointWriter) (_ []candidate, _ planned, left bool) {
-	// behind a remote magpie, the provider there that sealed it too
-	reads := func(c candidate) bool { return c.sameVendor(cp.Who, cp.Model) }
-	kept, pl, ok := keepCandidates(cands, pl, reads)
-	if ok {
-		return kept, pl, true
-	}
-	var found []candidate
-	var ws []Weighed
-	for i, c := range pl.unlisted {
-		if !reads(c) {
-			continue
-		}
-		found = append(found, c)
-		w := pl.unlistedW[i]
-		w.Unlisted = false // it is asked, as the conversation's only reader
-		ws = append(ws, w)
-	}
-	if len(found) == 0 {
-		return nil, pl, false
-	}
-	// the rows it goes to order with: they leave left, or the Routing page
-	// would have it both tried and unlisted, skipped
-	asked := make(map[string]bool, len(ws))
-	for _, w := range ws {
-		asked[w.ID] = true
-	}
-	pl.left = slices.DeleteFunc(pl.left, func(w Weighed) bool { return asked[w.ID] })
-	pl.order = append(pl.order, ws...)
-	return found, pl, true
-}
-
-// checkpointHeld is, of held, the key or account that sealed the native
-// compaction cp a request carries, when it is held there (in pl, which
-// checkpointReaders left only it in); nil when the request carries none.
-func checkpointHeld(cp *checkpointWriter, held []Weighed, pl planned) []Weighed {
-	if cp == nil {
-		return nil
-	}
-	ids := map[string]bool{}
-	for _, c := range append(slices.Clone(pl.capped), pl.held...) {
-		ids[c.rest] = true
-	}
-	var out []Weighed
-	for _, w := range held {
-		if w.Capped > 0 && ids[w.ID] {
-			out = append(out, w)
-		}
-	}
-	return out
-}
-
-// compactionCarriers keeps of cands those that can be asked Codex's own
-// compaction.
+// compactionCarriers keeps candidates whose Responses API can carry the
+// trigger or sealed context, without binding it to its original writer.
 func (s *Server) compactionCarriers(cands []candidate, pl planned) (_ []candidate, _ planned, left bool) {
 	return keepCandidates(cands, pl, func(c candidate) bool { return s.carriesCompaction(c.p, c.model) })
 }
@@ -444,105 +308,10 @@ func keepCandidates(cands []candidate, pl planned, keep func(candidate) bool) ([
 	return cands, pl, len(cands) > 0 || len(pl.held) > 0 || len(pl.capped) > 0
 }
 
-// compactionWho is who sealed the native compaction cp, for the trace;
-// "" for none.
-func compactionWho(cp *checkpointWriter) string {
-	if cp == nil {
-		return ""
-	}
-	return cp.Who
-}
-
-// checkpointError is what Codex is told when the compaction a request
-// carries was sealed by a key or account the request can't go to now:
-// why, as magpie's own settings say, and what lets the conversation go on
-// (#2642: it said "switched off, removed, or no longer serves" of an
-// account that was on, and "switch it on again" changed nothing).
-func checkpointError(model string, cp checkpointWriter) string {
-	what := "account"
-	if strings.Contains(cp.Who, "#") {
-		what = "key"
-	}
-	why, fix := checkpointGone(model, what, cp)
-	msg := fmt.Sprintf("This conversation was compacted natively by %s: the compaction is sealed (encrypted) to that %s, and no other key or account can read it. The request for %s can't go to it now: %s. magpie doesn't send the compaction to another, which would refuse it, nor drop it or summarise it in its place, which would lose the conversation's earlier context. To go on with this conversation, %s; or start a new conversation.",
-		cp.Who, what, model, why, fix)
-	if p, err := provider.Find(cp.Provider); err == nil {
-		if p.NativeCompaction {
-			msg += fmt.Sprintf(" Native compaction is on for %s, so each conversation it compacts is held to the %s that compacted it; turned off (the provider's Compaction row), magpie summarises instead, which any of them can read.", p.ID, what)
-		} else {
-			msg += fmt.Sprintf(" Native compaction is off for %s now, so a compaction magpie routes among its %ss is magpie's summary, which any of them can read.", p.ID, what)
-		}
-	}
-	return msg
-}
-
-// checkpointGone is why the key or account that sealed cp can't be asked
-// for model, and what would let it be: removed, signed out, its sign-in
-// lapsed, paused or switched off, the model kept from it, or the model or
-// group asked for not going to it. The capped and the held are told
-// checkpointCappedError's instead.
-func checkpointGone(model, what string, cp checkpointWriter) (why, fix string) {
-	p, err := provider.Find(cp.Provider)
-	if err != nil {
-		return fmt.Sprintf("the provider %s is no longer in magpie", cp.Provider),
-			fmt.Sprintf("add %s again with that %s", cp.Provider, what)
-	}
-	served := cp.Model
-	if served == "" {
-		served = model
-	}
-	if _, off := provider.ModelDisabled(p.ID, served); off {
-		return fmt.Sprintf("%s/%s is disabled", p.ID, served), fmt.Sprintf("enable %s/%s again", p.ID, served)
-	}
-	if _, kid, isKey := strings.Cut(cp.Who, "#"); isKey {
-		for _, k := range p.KeyList() {
-			if k.ID != kid {
-				continue
-			}
-			switch {
-			case !k.On:
-				return fmt.Sprintf("that key of %s is switched off", p.ID), "switch it on again in the provider's keys"
-			case !p.AccountServes(kid, served):
-				return fmt.Sprintf("that key is set not to serve %s (Model settings)", served), fmt.Sprintf("let it serve %s again", served)
-			}
-			return checkpointNotRouted(model, served)
-		}
-		return fmt.Sprintf("that key is no longer one of %s's", p.ID), fmt.Sprintf("add the same key to %s again", p.ID)
-	}
-	user := strings.TrimPrefix(cp.Who, cp.Provider+"@")
-	agent := cp.Provider
-	if p.Account != nil && p.Account.Agent != "" {
-		agent = p.Account.Agent
-	}
-	for _, l := range provider.Logins(agent) {
-		if !strings.EqualFold(l.User, user) {
-			continue
-		}
-		switch {
-		case l.Lapsed != "":
-			return "its sign-in has lapsed", fmt.Sprintf("sign in to %s again in magpie", l.User)
-		case l.Paused:
-			return "it is paused, passed over while magpie's other accounts are on", fmt.Sprintf("turn %s on again: the others can stay on beside it, and only this conversation is held to it", l.User)
-		case !l.On:
-			return "it is switched off in magpie", fmt.Sprintf("switch %s on again: the others can stay on beside it, and only this conversation is held to it", l.User)
-		case !p.AccountServes(l.User, served):
-			return fmt.Sprintf("it is set not to serve %s (Model settings)", served), fmt.Sprintf("let %s serve %s again", l.User, served)
-		}
-		return checkpointNotRouted(model, served)
-	}
-	return fmt.Sprintf("%s is no longer signed in to magpie", user), fmt.Sprintf("sign in to %s again in magpie", user)
-}
-
-// checkpointNotRouted is checkpointGone for a writer that is on and may
-// serve the model: what was asked for doesn't go to it.
-func checkpointNotRouted(model, served string) (why, fix string) {
-	return fmt.Sprintf("%s doesn't route to it (another model, or a routing group it isn't in)", model), fmt.Sprintf("ask for %s, which it compacted, through a route that has it", served)
-}
-
-// carrierError is what Codex is told when its compaction_trigger, asked
-// of a provider set to compact natively, has nowhere left that carries it.
+// carrierError explains why a request carrying native compaction cannot
+// use the chosen route without losing its earlier context.
 func carrierError(model string) string {
-	return fmt.Sprintf("Codex asked %s for its own compaction (native compaction), and none of the keys or accounts that serve %s now can be asked it on the Responses API. magpie doesn't turn it into a summary of its own unasked. Turn native compaction off for the provider to have magpie summarise the conversation instead.", model, model)
+	return fmt.Sprintf("The request for %s carries native compaction, but none of its available keys or accounts can carry it on the Responses API. Choose a provider and model with a Responses API, or start a new conversation using magpie's summaries.", model)
 }
 
 // compactionWatch reads, on the way past, the compaction a native

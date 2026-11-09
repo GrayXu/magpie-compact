@@ -387,10 +387,9 @@ type Provider struct {
 	// a summary and hands Codex that (its "magpie1:" compaction). Only a
 	// provider whose wire carries it takes it (CarriesCompaction): a
 	// Responses API (Sub2API, a remote magpie), a ChatGPT account, GitHub
-	// Copilot's GPT models. Such a compaction is sealed by the key or
-	// account that wrote it, so its conversation stays there, or is
-	// refused, never sent elsewhere to be dropped. Off, the default,
-	// keeps magpie's summary.
+	// Copilot's GPT models. Its sealed context follows normal routing
+	// across accounts, providers and clients; the destination upstream
+	// decides whether it can read it. Off, the default, keeps magpie's summary.
 	NativeCompaction bool `json:"nativeCompaction,omitempty"`
 
 	// MagpieUserAgent has every request go to the vendor with magpie's own
